@@ -135,8 +135,18 @@ class GameBrowser:
         return self.page.locator(".JHxP8e, .wYIgTb").last
 
     async def is_game_over(self) -> bool:
-        """Detect end screen via visible overlay text (not hidden SERP templates)."""
+        """Detect miss / end screen via overlay text only (not goal celebrations)."""
         assert self.page is not None
+        page = self.page
+
+        for text in ("Try again", "Game over"):
+            loc = page.get_by_text(text, exact=False)
+            try:
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    return True
+            except Exception:
+                continue
+
         overlay = self._game_overlay()
         for text in ("Try again", "Game over"):
             loc = overlay.get_by_text(text, exact=True)

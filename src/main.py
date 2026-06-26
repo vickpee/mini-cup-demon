@@ -10,9 +10,10 @@ from pathlib import Path
 
 from .browser import GameBrowser, wait_for_user_ready
 from .config import GameConfig
+from .game_state import wait_after_shot
 from .input import swipe_shot
 from .strategy import pick_target
-from .vision import is_game_over_screen, keeper_center_x
+from .tracking import KeeperTracker
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -46,26 +47,40 @@ async def run(args: argparse.Namespace) -> int:
         await asyncio.sleep(0.5)
 
         goals = 0
+        tracker = KeeperTracker()
         for attempt in range(1, args.max_shots + 1):
-            png = await canvas.screenshot()
+            await tracker.collect(canvas, config)
+            velocity = tracker.lateral_velocity()
+            cx = tracker.latest_centroid_x()
+            predicted = tracker.predict_centroid_x(config.shot_flight_time)
+            target = pick_target(predicted, config, keeper_velocity=velocity)
+
+            if cx is None:
+                print(f"Shot {attempt}: keeper not detected — shooting {target.x:.0f}")
+            else:
+                print(
+                    f"Shot {attempt}: keeper cx≈{cx:.0f} v≈{velocity:+.0f}px/s "
+                    f"→ predict {predicted:.0f} → target ({target.x:.0f}, {target.y:.0f})"
+                )
+
             if args.save_frames:
                 out = Path(args.save_frames)
                 out.mkdir(parents=True, exist_ok=True)
+                png = await canvas.screenshot()
                 (out / f"frame_{attempt:03d}.png").write_bytes(png)
 
-            kx = keeper_center_x(png, config)
-            target = pick_target(kx, config)
-            print(f"Shot {attempt}: keeper≈{kx:.0f} → target ({target.x:.0f}, {target.y:.0f})")
-
             await swipe_shot(page, canvas, config.ball, target, config)
-            await asyncio.sleep(args.shot_delay)
 
-            after = await canvas.screenshot()
-            if await browser.is_game_over() or is_game_over_screen(after, config):
-                print(f"Game over after {goals} goal(s) (miss on shot {attempt}).")
+            result = await wait_after_shot(
+                browser, canvas, config, timeout=args.shot_delay
+            )
+            if result == "miss":
+                print(f"Game over after {goals} goal(s).")
                 break
 
             goals += 1
+            print(f"Goal {goals} — lining up next shot…")
+            await asyncio.sleep(0.3)
 
         if goals == args.max_shots:
             print(f"Completed {goals} shots without game-over signal.")
