@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import io
+from typing import TYPE_CHECKING
 
 from PIL import Image
 
 from .config import GameConfig, KeeperBox
+from .keeper_js import KEEPER_BBOX_JS
+
+if TYPE_CHECKING:
+    from playwright.async_api import Locator
 
 
 def _is_grass(r: int, g: int, b: int) -> bool:
@@ -22,66 +27,180 @@ def _is_keeper_pixel(r: int, g: int, b: int) -> bool:
     return True
 
 
-def keeper_bbox(png_bytes: bytes, config: GameConfig) -> KeeperBox | None:
-    """
-    Locate the goalkeeper via a saturated-pixel bounding box in the lower
-    goal band, then return its centroid in canvas coordinates.
-    """
-    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-    w, h = img.size
+def _col_to_config_x(col_i: int, num_cols: int, config: GameConfig) -> float:
+    if num_cols <= 0:
+        return config.goal_left
+    return config.goal_left + col_i * (config.goal_right - config.goal_left) / num_cols
 
-    goal_top = int(config.goal_top * height_scale(h, config))
-    goal_bottom = int(config.goal_bottom * height_scale(h, config))
-    goal_left = int(config.goal_left * width_scale(w, config))
-    goal_right = int(config.goal_right * width_scale(w, config))
 
-    band = goal_bottom - goal_top
-    y0 = goal_top + int(band * config.keeper_scan_top_frac)
-    y1 = goal_top + int(band * config.keeper_scan_bottom_frac)
+def _peak_vertical_score(
+    pixels: Image.Image,
+    peak_i: int,
+    search_left_px: int,
+    y0: int,
+    y1: int,
+    window: int,
+) -> int:
+    """Prefer tall keeper sprites over flat net/crowd noise."""
+    left = max(0, search_left_px + peak_i - window // 2)
+    right = search_left_px + peak_i + window // 2
+    top, bottom = y1, y0
+    mass = 0
+    for y in range(y0, y1):
+        for x in range(left, right, 2):
+            if x < 0 or x >= pixels.width:
+                continue
+            if _is_keeper_pixel(*pixels.getpixel((x, y))):
+                mass += 1
+                top = min(top, y)
+                bottom = max(bottom, y)
+    height = max(0, bottom - top)
+    return height * mass
+
+
+def _pick_peak_column(
+    counts: list[int],
+    config: GameConfig,
+    *,
+    scale_x: float,
+    hint_x: float | None,
+    pixels: Image.Image | None = None,
+    search_left_px: int = 0,
+    y0: int = 0,
+    y1: int = 0,
+    window: int = 0,
+) -> int | None:
+    """Pick the keeper column peak; prefer the peak nearest hint when tracking."""
+    if not counts:
+        return None
+
+    margin = max(4, int(40 * scale_x))
+    peaks: list[tuple[int, int]] = []
+
+    for i in range(margin, len(counts) - margin):
+        c = counts[i]
+        if c < 4:
+            continue
+        if c >= counts[i - 1] and c > counts[i + 1]:
+            peaks.append((c, i))
+
+    if not peaks:
+        interior = range(margin, len(counts) - margin)
+        if not interior:
+            return None
+        best_i = max(interior, key=lambda i: counts[i])
+        if counts[best_i] < 4:
+            return None
+        peaks = [(counts[best_i], best_i)]
+
+    max_count = max(c for c, _ in peaks)
+    strong = [(c, i) for c, i in peaks if c >= max_count * 0.55]
+
+    if hint_x is not None and len(strong) > 1:
+        _, best_i = min(
+            strong,
+            key=lambda p: abs(_col_to_config_x(p[1], len(counts), config) - hint_x),
+        )
+        return best_i
+
+    if pixels is not None and window > 0:
+        return max(
+            strong,
+            key=lambda p: _peak_vertical_score(
+                pixels, p[1], search_left_px, y0, y1, window
+            ),
+        )[1]
+
+    return max(strong, key=lambda p: p[0])[1]
+
+
+def _keeper_bbox_from_pixels(
+    pixels: Image.Image,
+    config: GameConfig,
+    *,
+    region_left: float,
+    region_top: float,
+    region_width: float,
+    region_height: float,
+    hint_x: float | None = None,
+) -> KeeperBox | None:
+    """BBox centroid from a goal-band image (or full frame)."""
+    w, h = pixels.size
+    if w == 0 or h == 0:
+        return None
+
+    scale_x = w / region_width
+    scale_y = h / region_height
+
+    goal_top_px = int((config.goal_top - region_top) * scale_y)
+    goal_bottom_px = int((config.goal_bottom - region_top) * scale_y)
+    goal_top_px = max(0, min(goal_top_px, h))
+    goal_bottom_px = max(0, min(goal_bottom_px, h))
+
+    band = goal_bottom_px - goal_top_px
+    if band <= 0:
+        return None
+
+    y0 = goal_top_px + int(band * config.keeper_scan_top_frac)
+    y1 = goal_top_px + int(band * config.keeper_scan_bottom_frac)
+
+    goal_left_px = int((config.goal_left - region_left) * scale_x)
+    goal_right_px = int((config.goal_right - region_left) * scale_x)
+    goal_left_px = max(0, min(goal_left_px, w))
+    goal_right_px = max(0, min(goal_right_px, w))
+
+    search_left_px = goal_left_px
+    search_right_px = goal_right_px
+    if hint_x is not None:
+        hint_px = int((hint_x - region_left) * scale_x)
+        half = int(config.keeper_search_half_width * scale_x)
+        search_left_px = max(goal_left_px, hint_px - half)
+        search_right_px = min(goal_right_px, hint_px + half)
 
     counts: list[int] = []
-    for x in range(goal_left, goal_right):
+    for x in range(search_left_px, search_right_px):
         count = 0
         for y in range(y0, y1, 2):
-            if _is_keeper_pixel(*img.getpixel((x, y))):
+            if _is_keeper_pixel(*pixels.getpixel((x, y))):
                 count += 1
         counts.append(count)
 
-    window = max(8, int(config.keeper_bbox_width * width_scale(w, config)))
-    if len(counts) <= window:
+    window = max(8, int(config.keeper_bbox_width * scale_x))
+    peak_i = _pick_peak_column(
+        counts,
+        config,
+        scale_x=scale_x,
+        hint_x=hint_x,
+        pixels=pixels,
+        search_left_px=search_left_px,
+        y0=y0,
+        y1=y1,
+        window=window,
+    )
+    if peak_i is None:
         return None
 
-    best_sum = 0
-    best_start = 0
-    for i in range(len(counts) - window):
-        total = sum(counts[i : i + window])
-        if total > best_sum:
-            best_sum = total
-            best_start = i
-
-    if best_sum < 12:
-        return None
-
-    left_px = goal_left + best_start
-    right_px = goal_left + best_start + window
+    center_px = search_left_px + peak_i
+    left_px = int(center_px - window / 2)
+    right_px = left_px + window
 
     top_px = y1
     bottom_px = y0
     for y in range(y0, y1):
-        for x in range(left_px, right_px, 2):
-            if _is_keeper_pixel(*img.getpixel((x, y))):
+        for x in range(max(0, left_px), min(w, right_px), 2):
+            if _is_keeper_pixel(*pixels.getpixel((x, y))):
                 top_px = min(top_px, y)
                 bottom_px = max(bottom_px, y)
 
     if top_px >= bottom_px:
         return None
 
-    to_x = config.canvas_width / w
-    to_y = config.canvas_height / h
-    left = left_px * to_x
-    right = right_px * to_x
-    top = top_px * to_y
-    bottom = bottom_px * to_y
+    to_x = region_width / w
+    to_y = region_height / h
+    left = region_left + left_px * to_x
+    right = region_left + right_px * to_x
+    top = region_top + top_px * to_y
+    bottom = region_top + bottom_px * to_y
     return KeeperBox(
         cx=(left + right) / 2,
         cy=(top + bottom) / 2,
@@ -89,6 +208,99 @@ def keeper_bbox(png_bytes: bytes, config: GameConfig) -> KeeperBox | None:
         right=right,
         top=top,
         bottom=bottom,
+    )
+
+
+def keeper_bbox(
+    png_bytes: bytes,
+    config: GameConfig,
+    *,
+    hint_x: float | None = None,
+) -> KeeperBox | None:
+    """Locate keeper bbox from a full canvas PNG."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    return _keeper_bbox_from_pixels(
+        img,
+        config,
+        region_left=0,
+        region_top=0,
+        region_width=config.canvas_width,
+        region_height=config.canvas_height,
+        hint_x=hint_x,
+    )
+
+
+def _js_result_to_box(result: dict[str, float]) -> KeeperBox:
+    return KeeperBox(
+        cx=result["cx"],
+        cy=result["cy"],
+        left=result["left"],
+        right=result["right"],
+        top=result["top"],
+        bottom=result["bottom"],
+    )
+
+
+def _js_args(config: GameConfig, hint_x: float | None) -> dict:
+    return {
+        "goalLeft": config.goal_left,
+        "goalTop": config.goal_top,
+        "goalRight": config.goal_right,
+        "goalBottom": config.goal_bottom,
+        "scanTopFrac": config.keeper_scan_top_frac,
+        "scanBottomFrac": config.keeper_scan_bottom_frac,
+        "bboxWidth": config.keeper_bbox_width,
+        "canvasWidth": config.canvas_width,
+        "canvasHeight": config.canvas_height,
+        "hintX": hint_x,
+        "searchHalfWidth": config.keeper_search_half_width,
+    }
+
+
+async def _goal_band_image(canvas: Locator, config: GameConfig) -> Image.Image | None:
+    """Crop the goal band from a full canvas element screenshot."""
+    try:
+        png = await canvas.screenshot()
+    except Exception:
+        return None
+    img = Image.open(io.BytesIO(png)).convert("RGB")
+    w, h = img.size
+    left = int(config.goal_left * w / config.canvas_width)
+    top = int(config.goal_top * h / config.canvas_height)
+    right = int(config.goal_right * w / config.canvas_width)
+    bottom = int(config.goal_bottom * h / config.canvas_height)
+    return img.crop((left, top, right, bottom))
+
+
+async def detect_keeper_bbox(
+    canvas: Locator,
+    config: GameConfig,
+    *,
+    hint_x: float | None = None,
+) -> KeeperBox | None:
+    """
+    Fast path: read goal-band pixels in-page via getImageData.
+    Fallback: cropped goal-band screenshot + incremental Python scan.
+    """
+    try:
+        result = await canvas.evaluate(KEEPER_BBOX_JS, _js_args(config, hint_x))
+        if result:
+            return _js_result_to_box(result)
+    except Exception:
+        pass
+
+    band_img = await _goal_band_image(canvas, config)
+    if band_img is None:
+        return None
+
+    return _keeper_bbox_from_pixels(
+        band_img,
+        config,
+        region_left=config.goal_left,
+        region_top=config.goal_top,
+        region_width=config.goal_right - config.goal_left,
+        region_height=config.goal_bottom - config.goal_top,
+        hint_x=hint_x,
     )
 
 

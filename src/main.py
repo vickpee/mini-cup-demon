@@ -9,10 +9,15 @@ import sys
 from pathlib import Path
 
 from .browser import GameBrowser, wait_for_user_ready
-from .config import GameConfig
+from .config import GameConfig, shot_lead_time
+from .debug import (
+    clear_prediction_overlay,
+    format_prediction_debug,
+    show_prediction_overlay,
+)
 from .game_state import wait_after_shot
 from .input import swipe_shot
-from .strategy import pick_target
+from .strategy import _shoot_left, pick_target
 from .tracking import KeeperTracker
 
 
@@ -52,24 +57,53 @@ async def run(args: argparse.Namespace) -> int:
             await tracker.collect(canvas, config)
             velocity = tracker.lateral_velocity()
             cx = tracker.latest_centroid_x()
-            predicted = tracker.predict_centroid_x(config.shot_flight_time)
-            target = pick_target(predicted, config, keeper_velocity=velocity)
 
-            if cx is None:
-                print(f"Shot {attempt}: keeper not detected — shooting {target.x:.0f}")
-            else:
-                print(
-                    f"Shot {attempt}: keeper cx≈{cx:.0f} v≈{velocity:+.0f}px/s "
-                    f"→ predict {predicted:.0f} → target ({target.x:.0f}, {target.y:.0f})"
+            overlay_pause = args.debug_overlay_pause if args.debug_overlay else 0.0
+            lead = shot_lead_time(config, extra_delay=overlay_pause)
+            predicted = tracker.predict_centroid_x(lead)
+            shoot_left = _shoot_left(predicted, config, velocity)
+            target = pick_target(
+                predicted,
+                config,
+                keeper_velocity=velocity,
+                keeper_x=cx,
+            )
+
+            if args.debug_overlay:
+                await show_prediction_overlay(
+                    canvas,
+                    config,
+                    keeper_x=cx,
+                    predicted_x=predicted,
+                    shoot_left=shoot_left,
                 )
+                if overlay_pause > 0:
+                    await asyncio.sleep(overlay_pause)
+
+            await swipe_shot(page, canvas, config.ball, target, config)
+
+            if args.debug_overlay:
+                await clear_prediction_overlay(canvas)
+
+            model = "sin" if tracker.using_sinusoid() else "lin"
+            print(f"Shot {attempt} ({model}):")
+            print(
+                format_prediction_debug(
+                    keeper_x=cx,
+                    predicted_x=predicted,
+                    velocity=velocity,
+                    config=config,
+                    lead_time=lead,
+                    shoot_left=shoot_left,
+                    target_x=target.x,
+                )
+            )
 
             if args.save_frames:
                 out = Path(args.save_frames)
                 out.mkdir(parents=True, exist_ok=True)
                 png = await canvas.screenshot()
                 (out / f"frame_{attempt:03d}.png").write_bytes(png)
-
-            await swipe_shot(page, canvas, config.ball, target, config)
 
             result = await wait_after_shot(
                 browser, canvas, config, timeout=args.shot_delay
@@ -126,6 +160,17 @@ def main() -> None:
     parser.add_argument("--shot-delay", type=float, default=1.8, help="Seconds between shots")
     parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for canvas after you press Enter")
     parser.add_argument("--save-frames", type=str, default="", help="Directory to save screenshots")
+    parser.add_argument(
+        "--debug-overlay",
+        action="store_true",
+        help="Draw keeper now/predicted lines on the canvas before each shot",
+    )
+    parser.add_argument(
+        "--debug-overlay-pause",
+        type=float,
+        default=0.0,
+        help="Optional pause before shooting when using --debug-overlay (hurts accuracy)",
+    )
     parser.add_argument("--pause", action="store_true", help="Keep browser open after run")
     args = parser.parse_args()
     raise SystemExit(asyncio.run(run(args)))

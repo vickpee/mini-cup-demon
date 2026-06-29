@@ -8,14 +8,15 @@ import time
 from playwright.async_api import Locator
 
 from .config import GameConfig, KeeperBox
-from .vision import keeper_bbox
+from .motion import fit_sinusoid, predict_sinusoid
+from .vision import detect_keeper_bbox
 
 
 class KeeperTracker:
     def __init__(self) -> None:
         self._samples: list[tuple[float, float, KeeperBox]] = []
 
-    def clear(self) -> None:
+    def clear_samples(self) -> None:
         self._samples.clear()
 
     @property
@@ -34,15 +35,19 @@ class KeeperTracker:
         interval_ms: int | None = None,
     ) -> bool:
         """Sample keeper bbox centroids; return False if never detected."""
-        self.clear()
+        self.clear_samples()
         n = samples if samples is not None else config.track_samples
         delay = (interval_ms if interval_ms is not None else config.track_interval_ms) / 1000
+        hint: float | None = None
 
-        for _ in range(n):
-            png = await canvas.screenshot()
-            box = keeper_bbox(png, config)
+        for i in range(n):
+            # Full goal scan on the first sample; narrow search only within this burst.
+            box = await detect_keeper_bbox(
+                canvas, config, hint_x=hint if i > 0 else None
+            )
             if box is not None:
                 self.add(box)
+                hint = box.cx
             if delay > 0:
                 await asyncio.sleep(delay)
 
@@ -66,8 +71,32 @@ class KeeperTracker:
         return self._samples[-1][1]
 
     def predict_centroid_x(self, lead_time: float) -> float:
-        """Extrapolate keeper centroid forward by lead_time seconds."""
+        """Predict keeper x at ball arrival using sinusoidal fit, else linear."""
         if not self._samples:
             return 0.0
+
+        t0 = self._samples[0][0]
+        rel = [(t - t0, x) for t, x, _ in self._samples]
+        t_last_rel = self._samples[-1][0] - t0
         _, cx, _ = self._samples[-1]
-        return cx + self.lateral_velocity() * lead_time
+        velocity = self.lateral_velocity()
+        linear = cx + velocity * lead_time
+
+        fit = fit_sinusoid(rel)
+        if fit is None:
+            return linear
+
+        center, amplitude, omega, phase = fit
+        sin_pred = predict_sinusoid(
+            center, amplitude, omega, phase, t_last_rel + lead_time
+        )
+
+        # Reject sin extrapolation that fights observed motion direction.
+        if abs(velocity) > 8 and (sin_pred - cx) * velocity < 0:
+            return linear
+        return sin_pred
+
+    def using_sinusoid(self) -> bool:
+        t0 = self._samples[0][0]
+        rel = [(t - t0, x) for t, x, _ in self._samples]
+        return fit_sinusoid(rel) is not None

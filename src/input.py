@@ -59,13 +59,15 @@ async def swipe_shot(
     await canvas.dispatch_event("pointerdown", _pointer_payload(sx, sy, buttons=1))
     await canvas.dispatch_event("touchstart", _touch_payload(sx, sy))
 
+    step_delay = config.swipe_step_ms / 1000
     for i in range(1, config.swipe_steps + 1):
         t = i / config.swipe_steps
         x = sx + (ex - sx) * t
         y = sy + (ey - sy) * t
         await canvas.dispatch_event("pointermove", _pointer_payload(x, y, buttons=1))
         await canvas.dispatch_event("touchmove", _touch_payload(x, y))
-        await asyncio.sleep(config.swipe_step_ms / 1000)
+        if i < config.swipe_steps:
+            await asyncio.sleep(step_delay)
 
     # touchend must list the lifted finger in changedTouches (empty breaks release).
     end_touch = _touch_point(ex, ey)
